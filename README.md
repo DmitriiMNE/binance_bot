@@ -31,7 +31,6 @@
     ```bash
     pip install -r requirements.txt
     ```
-    *(Примечание: необходимо будет создать файл `requirements.txt`)*
 3.  Заполните `config.json` своими данными.
 4.  Запустите бота:
     ```bash
