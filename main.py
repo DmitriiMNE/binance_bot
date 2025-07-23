@@ -15,7 +15,7 @@ with open('config.json') as f:
 API_KEY = config['api_key']
 API_SECRET = config['api_secret']
 SYMBOL = config['symbol']
-QUANTITY = config['quantity']
+BALANCE_PERCENT = config['balance_percent']  # Процент от баланса для торговли
 TARGET_PROFIT_PERCENT = config['target_profit_percent']
 COMMISSION_PERCENT = config['commission_percent']
 ATR_PERIOD = 14
@@ -23,6 +23,56 @@ ATR_MULTIPLIER = 1.5
 SLEEP_INTERVAL = 30
 
 client = Client(API_KEY, API_SECRET)
+
+def get_usdt_balance():
+    """Получает доступный баланс USDT"""
+    try:
+        account = client.get_account()
+        for balance in account['balances']:
+            if balance['asset'] == 'USDT':
+                return float(balance['free'])
+        return 0.0
+    except BinanceAPIException as e:
+        logger.error(f"Error getting USDT balance: {e}")
+        return 0.0
+
+def calculate_quantity(buy_price, usdt_amount):
+    """Рассчитывает количество криптовалюты для покупки"""
+    try:
+        # Получаем информацию о символе для правильного округления
+        symbol_info = client.get_symbol_info(SYMBOL)
+        lot_size_filter = None
+        
+        for filter_item in symbol_info['filters']:
+            if filter_item['filterType'] == 'LOT_SIZE':
+                lot_size_filter = filter_item
+                break
+        
+        if lot_size_filter:
+            step_size = float(lot_size_filter['stepSize'])
+            min_qty = float(lot_size_filter['minQty'])
+            
+            # Рассчитываем количество
+            quantity = usdt_amount / buy_price
+            
+            # Округляем до правильного шага
+            precision = len(str(step_size).split('.')[-1].rstrip('0'))
+            quantity = round(quantity, precision)
+            
+            # Проверяем минимальное количество
+            if quantity < min_qty:
+                logger.warning(f"Calculated quantity {quantity} is less than minimum {min_qty}")
+                return None
+                
+            return quantity
+        else:
+            # Если не удалось получить фильтры, используем базовую логику
+            quantity = usdt_amount / buy_price
+            return round(quantity, 6)  # Базовая точность для большинства символов
+            
+    except Exception as e:
+        logger.error(f"Error calculating quantity: {e}")
+        return None
 
 def get_klines(symbol, interval='1h', limit=100):
     try:
@@ -87,6 +137,7 @@ def cancel_order(order_id):
 active_buy_order_id = None
 active_sell_order_id = None
 position_open = False
+trade_quantity = None  # Хранит количество для текущей сделки
 
 while True:
     try:
@@ -95,9 +146,21 @@ while True:
             df = get_klines(SYMBOL)
             buy_price, _ = calculate_levels(df)
             if buy_price:
-                order = place_limit_order(SIDE_BUY, buy_price, QUANTITY)
-                if order:
-                    active_buy_order_id = order['orderId']
+                # Получаем баланс и рассчитываем количество для покупки
+                usdt_balance = get_usdt_balance()
+                usdt_to_trade = usdt_balance * (BALANCE_PERCENT / 100)
+                
+                if usdt_to_trade < 10:  # Минимальная сумма для торговли
+                    logger.warning(f"Insufficient balance for trading. Available: {usdt_balance} USDT, Required: at least {10/BALANCE_PERCENT*100} USDT")
+                    time.sleep(SLEEP_INTERVAL)
+                    continue
+                
+                quantity = calculate_quantity(buy_price, usdt_to_trade)
+                if quantity:
+                    trade_quantity = quantity
+                    order = place_limit_order(SIDE_BUY, buy_price, quantity)
+                    if order:
+                        active_buy_order_id = order['orderId']
 
         # --- Проверка исполнения ордера на покупку ---
         if active_buy_order_id:
@@ -115,7 +178,7 @@ while True:
                 commission = (actual_buy_price + (actual_buy_price + profit_margin)) * (COMMISSION_PERCENT / 100)
                 sell_price = actual_buy_price + profit_margin + commission
                 
-                sell_order = place_limit_order(SIDE_SELL, sell_price, QUANTITY)
+                sell_order = place_limit_order(SIDE_SELL, sell_price, trade_quantity)
                 if sell_order:
                     active_sell_order_id = sell_order['orderId']
 
@@ -127,6 +190,7 @@ while True:
                 send_telegram_message(f"💰 Profit taken! Sold at {order_info['price']}")
                 active_sell_order_id = None
                 position_open = False
+                trade_quantity = None  # Сбрасываем количество
 
         # --- Логика отмены, если цена ушла далеко ---
         # (Можно добавить позже)
